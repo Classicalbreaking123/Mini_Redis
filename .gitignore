@@ -1,0 +1,8 @@
+database/*.txt
+database/*.aof
+
+server/server
+server/replica
+client/client
+
+*.o
