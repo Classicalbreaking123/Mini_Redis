@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <fstream>
 #include <ctime>
 #include <vector>
@@ -16,21 +17,24 @@
 using namespace std;
 
 const int MAX_KEYS = 5;
-
+int current_size = 0;
 
 
 unordered_map<string, string> database;
 
 unordered_map<string, time_t> expiry_times;
 
-
 list<string> lru_list;
 unordered_map<string, list<string>::iterator> lru_position;
 
 
-mutex database_mutex;
+unordered_map<string, shared_mutex> key_mutex;
 
 
+
+mutex lru_mutex;
+mutex capacity_mutex;
+mutex eviction_mutex;
 string database_file = "database/dump.txt";
 string aof_file =
     "database/appendonly.aof";
@@ -38,7 +42,9 @@ string aof_file =
 
 int aof_command_count = 0;
     
-    void append_to_aof(
+    void remove_from_lru(const string& key);
+
+void append_to_aof(
     const string& command
 )
 {
@@ -53,7 +59,28 @@ int aof_command_count = 0;
 
     outfile.close();
 }
+bool remove_if_expired_locked(const string& key)
+{
+    auto it = expiry_times.find(key);
 
+    if (it == expiry_times.end())
+        return false;
+
+    if (time(NULL) < it->second)
+        return false;
+
+   database.erase(key);
+expiry_times.erase(it);
+
+{
+    lock_guard<mutex> lru_lock(lru_mutex);
+    remove_from_lru(key);
+}
+    cout << "Expired key removed: "
+         << key << endl;
+
+    return true;
+}
 void replicate_command(const string& command) {
 
     int replica_socket =
@@ -70,7 +97,7 @@ void replicate_command(const string& command) {
         AF_INET;
 
     replica_address.sin_port =
-        htons(8081);
+        htons(follower_port);
 
       inet_pton(AF_INET,
           "127.0.0.1",
@@ -99,7 +126,57 @@ void replicate_command(const string& command) {
     close(replica_socket);
 }
 
-void remove_from_lru_locked(const string& key) {
+
+void heartbeat_worker()
+{
+    while (true)
+    {
+        int replica_socket =
+            socket(AF_INET,
+                   SOCK_STREAM,
+                   0);
+
+        if (replica_socket >= 0)
+        {
+            sockaddr_in replica_address;
+
+            replica_address.sin_family = AF_INET;
+            replica_address.sin_port = htons(8081);
+
+            inet_pton(AF_INET,
+                      "127.0.0.1",
+                      &replica_address.sin_addr);
+if (connect(replica_socket,
+            (sockaddr*)&replica_address,
+            sizeof(replica_address)) >= 0)
+{
+    cout << "Heartbeat sent!" << endl;
+
+    string heartbeat = "HEARTBEAT";
+    send(replica_socket,
+         heartbeat.c_str(),
+         heartbeat.length() + 1,
+         0);
+
+    char buffer[1024];
+    recv(replica_socket,
+         buffer,
+         sizeof(buffer),
+         0);
+}
+else
+{
+    perror("Heartbeat connect");
+}
+
+            close(replica_socket);
+        }
+
+        sleep(1);
+    }
+}
+
+void remove_from_lru(const string& key) {
     auto it = lru_position.find(key);
     if (it != lru_position.end()) {
         lru_list.erase(it->second);
@@ -108,14 +185,14 @@ void remove_from_lru_locked(const string& key) {
 }
 
 
-void touch_lru_locked(const string& key) {
-    remove_from_lru_locked(key);
+void touch_lru(const string& key) {
+    remove_from_lru(key);
     lru_list.push_front(key);
     lru_position[key] = lru_list.begin();
 }
 
 
-void rebuild_lru_from_database_locked() {
+void rebuild_lru_from_database() {
     lru_list.clear();
     lru_position.clear();
 
@@ -286,7 +363,7 @@ bool cleanup_expired_keys_locked() {
     for (const string& key : expired_keys) {
         database.erase(key);
         expiry_times.erase(key);
-        remove_from_lru_locked(key);
+        remove_from_lru(key);
 
         cout << "Expired key removed: " << key << endl;
         changed = true;
@@ -294,24 +371,88 @@ bool cleanup_expired_keys_locked() {
 
     return changed;
 }
+void expiry_worker()
+{
+    while (true)
+    {
+        {
+         
 
+          bool changed = false;
 
-bool evict_lru_key_locked() {
-    if (lru_list.empty()) {
-        return false;
+for (auto it = database.begin(); it != database.end(); )
+{
+    unique_lock<shared_mutex> key_lock(key_mutex[it->first]);
+
+    if (remove_if_expired_locked(it->first))
+    {
+        changed = true;
+        it = database.begin();   // database changed
     }
-
-    string key = lru_list.back();
-    lru_list.pop_back();
-    lru_position.erase(key);
-    database.erase(key);
-    expiry_times.erase(key);
-
-    cout << "Evicted LRU key: " << key << endl;
-    return true;
+    else
+    {
+        ++it;
+    }
 }
 
-// HANDLE ONE CLIENT
+            if (changed)
+            {
+                save_database();
+            }
+        }
+
+        this_thread::sleep_for(
+            chrono::seconds(1));
+    }
+}
+
+
+bool evict_lru_key()
+{
+    while (true)
+    {
+        string victim;
+
+        // Step 1: Read current LRU tail
+        {
+            lock_guard<mutex> lru_lock(lru_mutex);
+
+            if (lru_list.empty())
+                return false;
+
+            victim = lru_list.back();
+        }
+
+        // Step 2: Lock the victim key
+        unique_lock<shared_mutex> victim_lock(key_mutex[victim]);
+
+        // Step 3: Reacquire LRU and verify
+        {
+            lock_guard<mutex> lru_lock(lru_mutex);
+
+            if (lru_list.empty())
+                continue;
+
+            if (lru_list.back() != victim)
+                continue;
+
+            // Victim is still the LRU
+            lru_list.pop_back();
+            lru_position.erase(victim);
+
+            database.erase(victim);
+            expiry_times.erase(victim);
+
+            cout << "Evicted LRU key: "
+                 << victim
+                 << endl;
+
+            return true;
+        }
+    }
+}
+
+
 void handle_client(int client_socket) {
     cout << "Client connected!" << endl;
 
@@ -355,22 +496,34 @@ void handle_client(int client_socket) {
             }
 
             string response = "OK";
+unique_lock<shared_mutex> lock(key_mutex[key]);
 
-            database_mutex.lock();
 
            
-            cleanup_expired_keys_locked();
+           
 
             bool key_exists = (database.count(key) > 0);
 
             // If this is a NEW key, make room using LRU
-            if (!key_exists) {
-                while (database.size() >= MAX_KEYS) {
-                    if (!evict_lru_key_locked()) {
-                        break;
-                    }
-                }
-            }
+          if (!key_exists)
+{
+    lock_guard<mutex> capacity_lock(capacity_mutex);
+
+    if (current_size >= MAX_KEYS)
+    {
+        lock_guard<mutex> eviction_lock(eviction_mutex);
+
+        while (current_size >= MAX_KEYS)
+        {
+            if (!evict_lru_key())
+                break;
+
+            current_size--;
+        }
+    }
+
+    current_size++;
+}
 
             database[key] = value;
 
@@ -380,8 +533,10 @@ void handle_client(int client_socket) {
                 expiry_times.erase(key);
             }
 
-            touch_lru_locked(key);
-
+           {
+    lock_guard<mutex> lru_lock(lru_mutex);
+    touch_lru(key);
+}
             save_database();
            
               
@@ -397,7 +552,7 @@ if (aof_command_count >=
    
 }
 
-            database_mutex.unlock();
+        
               replicate_command(command);
             send(client_socket,
                  response.c_str(),
@@ -412,43 +567,44 @@ if (aof_command_count >=
 
             string response = "KEY NOT FOUND";
             bool changed = false;
+            bool expired = false;
 
-            database_mutex.lock();
+{
+    shared_lock<shared_mutex> lock(key_mutex[key]);
 
-            
-            if (database.size() > 10) {
-                changed = cleanup_expired_keys_locked();
-            }
+    auto expiry_it = expiry_times.find(key);
 
-            auto exp_it = expiry_times.find(key);
+    if (expiry_it != expiry_times.end() &&
+        time(NULL) >= expiry_it->second)
+    {
+        expired = true;
+    }
+    else
+    {
+        auto it = database.find(key);
 
-            if (exp_it != expiry_times.end()) {
-                time_t expiry_time = exp_it->second;
+        if (it != database.end())
+        {
+            response = it->second;
 
-                
-                if (time(NULL) >= expiry_time || database.count(key) == 0) {
-                    database.erase(key);
-                    expiry_times.erase(key);
-                    remove_from_lru_locked(key);
-                    response = "KEY NOT FOUND";
-                    changed = true;
-                } else {
-                    response = database[key];
-                    touch_lru_locked(key);
-                }
-            } else {
-                auto db_it = database.find(key);
-                if (db_it != database.end()) {
-                    response = db_it->second;
-                    touch_lru_locked(key);
-                }
-            }
+            lock_guard<mutex> lru_lock(lru_mutex);
+            touch_lru(key);
+        }
+    }
+}
 
-            if (changed) {
-                save_database();
-            }
+if (expired)
+{
+    unique_lock<shared_mutex> lock(key_mutex[key]);
 
-            database_mutex.unlock();
+    changed = remove_if_expired_locked(key);
+
+    if (changed)
+        save_database();
+
+    response = "KEY NOT FOUND";
+}
+          
 
             send(client_socket,
                  response.c_str(),
@@ -461,11 +617,15 @@ if (aof_command_count >=
             string key;
             ss >> key;
 
-            database_mutex.lock();
+            unique_lock<shared_mutex> lock(key_mutex[key]);
+
 
             database.erase(key);
             expiry_times.erase(key);
-            remove_from_lru_locked(key);
+    {
+    lock_guard<mutex> lru_lock(lru_mutex);
+    remove_from_lru(key);
+}
 
             save_database();
            
@@ -480,7 +640,7 @@ if (aof_command_count >=
    
 }
 
-            database_mutex.unlock();
+          
              replicate_command(command);
             string response = "DELETED";
 
@@ -492,7 +652,8 @@ if (aof_command_count >=
         
         else if (operation == "SYNC")
 {
-    database_mutex.lock();
+
+
 
     string response;
 
@@ -506,7 +667,6 @@ if (aof_command_count >=
             "\n";
     }
 
-    database_mutex.unlock();
 
     send(
         client_socket,
@@ -536,45 +696,74 @@ int main() {
     
     load_database();
     replay_aof();
+    current_size = database.size();
     aof_command_count =
     count_aof_commands();
 
-    database_mutex.lock();
+   
+bool changed = false;
 
+{
     
-    bool changed = cleanup_expired_keys_locked();
 
-    
-    rebuild_lru_from_database_locked();
+    changed = cleanup_expired_keys_locked();
+    current_size = database.size();
+    rebuild_lru_from_database();
 
-    
-    while (database.size() > MAX_KEYS) {
-        if (!evict_lru_key_locked()) {
-            break;
-        }
-        changed = true;
+   while (current_size > MAX_KEYS)
+{
+    if (!evict_lru_key())
+    {
+        break;
     }
 
-    if (changed) {
+    current_size--;
+    changed = true;
+}
+
+    if (changed)
+    {
         save_database();
     }
+}  
 
-    database_mutex.unlock();
+thread expiry(expiry_worker);
+expiry.detach();
+follower_port = REPLICA_PORT;
+thread heartbeat(heartbeat_worker);
+heartbeat.detach();
+   
 
     cout << "Database loaded from disk!" << endl;
 
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket < 0)
+    {
+        perror("socket");
+        return 1;
+    }
 
-    sockaddr_in server_address;
+    int opt = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in server_address{};
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(8080);
     server_address.sin_addr.s_addr = INADDR_ANY;
 
-    bind(server_socket,
+    if (bind(server_socket,
          (struct sockaddr*)&server_address,
-         sizeof(server_address));
+         sizeof(server_address)) < 0)
+    {
+        perror("bind");
+        return 1;
+    }
 
-    listen(server_socket, 5);
+    if (listen(server_socket, 5) < 0)
+    {
+        perror("listen");
+        return 1;
+    }
 
     cout << "MiniRedis Server listening on port 8080..." << endl;
 
@@ -591,3 +780,4 @@ int main() {
     close(server_socket);
     return 0;
 }
+
