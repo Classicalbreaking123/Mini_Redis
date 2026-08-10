@@ -569,42 +569,52 @@ if (aof_command_count >=
             bool changed = false;
             bool expired = false;
 
-{
-    shared_lock<shared_mutex> lock(key_mutex[key]);
+            // Step 1: Lock the key and read its value/expiry.
+            // IMPORTANT: do not acquire lru_mutex while this key lock
+            // is held. This avoids a key-lock -> LRU-lock cycle.
+            {
+                shared_lock<shared_mutex> key_lock(key_mutex[key]);
 
-    auto expiry_it = expiry_times.find(key);
+                auto expiry_it = expiry_times.find(key);
 
-    if (expiry_it != expiry_times.end() &&
-        time(NULL) >= expiry_it->second)
-    {
-        expired = true;
-    }
-    else
-    {
-        auto it = database.find(key);
+                if (expiry_it != expiry_times.end() &&
+                    time(NULL) >= expiry_it->second)
+                {
+                    expired = true;
+                }
+                else
+                {
+                    auto it = database.find(key);
 
-        if (it != database.end())
-        {
-            response = it->second;
+                    if (it != database.end())
+                    {
+                        response = it->second;
+                    }
+                }
+            } // key_lock released
 
-            lock_guard<mutex> lru_lock(lru_mutex);
-            touch_lru(key);
-        }
-    }
-}
+            // Step 2: Update LRU only after releasing the key lock.
+            if (!expired && response != "KEY NOT FOUND")
+            {
+                lock_guard<mutex> lru_lock(lru_mutex);
+                touch_lru(key);
+            }
 
-if (expired)
-{
-    unique_lock<shared_mutex> lock(key_mutex[key]);
+            // Step 3: If the key was expired, reacquire its key lock
+            // and remove it. remove_if_expired_locked() may then acquire
+            // lru_mutex, but we no longer hold the key lock elsewhere
+            // while waiting for lru_mutex from the GET path.
+            if (expired)
+            {
+                unique_lock<shared_mutex> key_lock(key_mutex[key]);
 
-    changed = remove_if_expired_locked(key);
+                changed = remove_if_expired_locked(key);
 
-    if (changed)
-        save_database();
+                if (changed)
+                    save_database();
 
-    response = "KEY NOT FOUND";
-}
-          
+                response = "KEY NOT FOUND";
+            }
 
             send(client_socket,
                  response.c_str(),
@@ -612,7 +622,6 @@ if (expired)
                  0);
         }
 
-       
         else if (operation == "DEL") {
             string key;
             ss >> key;
