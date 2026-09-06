@@ -376,24 +376,26 @@ void expiry_worker()
     while (true)
     {
         {
-         
+            bool changed = false;
 
-          bool changed = false;
+            // Global lock order: lru_mutex -> key_mutex.
+            lock_guard<mutex> lru_lock(lru_mutex);
 
-for (auto it = database.begin(); it != database.end(); )
-{
-    unique_lock<shared_mutex> key_lock(key_mutex[it->first]);
+            for (auto it = database.begin(); it != database.end(); )
+            {
+                string key = it->first;
+                unique_lock<shared_mutex> key_lock(key_mutex[key]);
 
-    if (remove_if_expired_locked(it->first))
-    {
-        changed = true;
-        it = database.begin();   // database changed
-    }
-    else
-    {
-        ++it;
-    }
-}
+                if (remove_if_expired_locked(key))
+                {
+                    changed = true;
+                    it = database.begin();
+                }
+                else
+                {
+                    ++it;
+                }
+            }
 
             if (changed)
             {
@@ -409,47 +411,31 @@ for (auto it = database.begin(); it != database.end(); )
 
 bool evict_lru_key()
 {
-    while (true)
-    {
-        string victim;
+    lock_guard<mutex> lru_lock(lru_mutex);
 
-        // Step 1: Read current LRU tail
-        {
-            lock_guard<mutex> lru_lock(lru_mutex);
+    if (lru_list.empty())
+        return false;
 
-            if (lru_list.empty())
-                return false;
+    string victim = lru_list.back();
+    unique_lock<shared_mutex> victim_lock(key_mutex[victim]);
 
-            victim = lru_list.back();
-        }
+    // Re-check after acquiring the victim key lock.
+    if (lru_position.find(victim) == lru_position.end())
+        return false;
 
-        // Step 2: Lock the victim key
-        unique_lock<shared_mutex> victim_lock(key_mutex[victim]);
+    if (lru_list.back() != victim)
+        return false;
 
-        // Step 3: Reacquire LRU and verify
-        {
-            lock_guard<mutex> lru_lock(lru_mutex);
+    lru_list.pop_back();
+    lru_position.erase(victim);
+    database.erase(victim);
+    expiry_times.erase(victim);
 
-            if (lru_list.empty())
-                continue;
+    cout << "Evicted LRU key: "
+         << victim
+         << endl;
 
-            if (lru_list.back() != victim)
-                continue;
-
-            // Victim is still the LRU
-            lru_list.pop_back();
-            lru_position.erase(victim);
-
-            database.erase(victim);
-            expiry_times.erase(victim);
-
-            cout << "Evicted LRU key: "
-                 << victim
-                 << endl;
-
-            return true;
-        }
-    }
+    return true;
 }
 
 
@@ -496,125 +482,120 @@ void handle_client(int client_socket) {
             }
 
             string response = "OK";
-unique_lock<shared_mutex> lock(key_mutex[key]);
 
+            {
+                // Global lock order: LRU -> key.
+                lock_guard<mutex> lru_lock(lru_mutex);
+                unique_lock<shared_mutex> key_lock(key_mutex[key]);
 
-           
-           
+                // Re-check after acquiring locks.
+                bool key_exists = (database.count(key) > 0);
 
-            bool key_exists = (database.count(key) > 0);
+                if (!key_exists)
+                {
+                    lock_guard<mutex> capacity_lock(capacity_mutex);
 
-            // If this is a NEW key, make room using LRU
-          if (!key_exists)
-{
-    lock_guard<mutex> capacity_lock(capacity_mutex);
+                    if (current_size >= MAX_KEYS)
+                    {
+                        lock_guard<mutex> eviction_lock(eviction_mutex);
 
-    if (current_size >= MAX_KEYS)
-    {
-        lock_guard<mutex> eviction_lock(eviction_mutex);
+                        while (current_size >= MAX_KEYS)
+                        {
+                            if (lru_list.empty())
+                                break;
 
-        while (current_size >= MAX_KEYS)
-        {
-            if (!evict_lru_key())
-                break;
+                            string victim = lru_list.back();
+                            unique_lock<shared_mutex> victim_lock(key_mutex[victim]);
 
-            current_size--;
-        }
-    }
+                            // Re-check after acquiring the victim key lock.
+                            if (lru_position.find(victim) == lru_position.end())
+                                continue;
 
-    current_size++;
-}
+                            if (lru_list.back() != victim)
+                                continue;
 
-            database[key] = value;
+                            lru_list.pop_back();
+                            lru_position.erase(victim);
+                            database.erase(victim);
+                            expiry_times.erase(victim);
+                            current_size--;
 
-            if (has_expiry) {
-                expiry_times[key] = time(NULL) + expiry_seconds;
-            } else {
-                expiry_times.erase(key);
+                            cout << "Evicted LRU key: "
+                                 << victim << endl;
+                        }
+                    }
+
+                    if (current_size < MAX_KEYS)
+                        current_size++;
+                }
+
+                database[key] = value;
+
+                if (has_expiry) {
+                    expiry_times[key] = time(NULL) + expiry_seconds;
+                } else {
+                    expiry_times.erase(key);
+                }
+
+                touch_lru(key);
             }
 
-           {
-    lock_guard<mutex> lru_lock(lru_mutex);
-    touch_lru(key);
-}
             save_database();
-           
-              
-append_to_aof(command);
-aof_command_count++;
 
+            append_to_aof(command);
+            aof_command_count++;
 
-if (aof_command_count >=
-    AOF_REWRITE_THRESHOLD)
-{
-    rewrite_aof();
+            if (aof_command_count >=
+                AOF_REWRITE_THRESHOLD)
+            {
+                rewrite_aof();
+            }
 
-   
-}
-
-        
-              replicate_command(command);
+            replicate_command(command);
             send(client_socket,
                  response.c_str(),
                  response.length() + 1,
                  0);
         }
 
-        
         else if (operation == "GET") {
             string key;
             ss >> key;
 
             string response = "KEY NOT FOUND";
             bool changed = false;
-            bool expired = false;
 
-            // Step 1: Lock the key and read its value/expiry.
-            // IMPORTANT: do not acquire lru_mutex while this key lock
-            // is held. This avoids a key-lock -> LRU-lock cycle.
+            // Global lock order: LRU -> key.
+            lock_guard<mutex> lru_lock(lru_mutex);
+            unique_lock<shared_mutex> key_lock(key_mutex[key]);
+
+            auto expiry_it = expiry_times.find(key);
+
+            if (expiry_it != expiry_times.end() &&
+                time(NULL) >= expiry_it->second)
             {
-                shared_lock<shared_mutex> key_lock(key_mutex[key]);
+                database.erase(key);
+                expiry_times.erase(expiry_it);
+                remove_from_lru(key);
 
-                auto expiry_it = expiry_times.find(key);
+                if (current_size > 0)
+                    current_size--;
 
-                if (expiry_it != expiry_times.end() &&
-                    time(NULL) >= expiry_it->second)
-                {
-                    expired = true;
-                }
-                else
-                {
-                    auto it = database.find(key);
-
-                    if (it != database.end())
-                    {
-                        response = it->second;
-                    }
-                }
-            } // key_lock released
-
-            // Step 2: Update LRU only after releasing the key lock.
-            if (!expired && response != "KEY NOT FOUND")
+                changed = true;
+            }
+            else
             {
-                lock_guard<mutex> lru_lock(lru_mutex);
-                touch_lru(key);
+                auto it = database.find(key);
+
+                if (it != database.end())
+                {
+                    response = it->second;
+                    touch_lru(key);
+                }
             }
 
-            // Step 3: If the key was expired, reacquire its key lock
-            // and remove it. remove_if_expired_locked() may then acquire
-            // lru_mutex, but we no longer hold the key lock elsewhere
-            // while waiting for lru_mutex from the GET path.
-            if (expired)
-            {
-                unique_lock<shared_mutex> key_lock(key_mutex[key]);
-
-                changed = remove_if_expired_locked(key);
-
-                if (changed)
-                    save_database();
-
-                response = "KEY NOT FOUND";
-            }
+            if (changed)
+                save_database();
 
             send(client_socket,
                  response.c_str(),
@@ -626,31 +607,32 @@ if (aof_command_count >=
             string key;
             ss >> key;
 
-            unique_lock<shared_mutex> lock(key_mutex[key]);
+            // Global lock order: LRU -> key.
+            lock_guard<mutex> lru_lock(lru_mutex);
+            unique_lock<shared_mutex> key_lock(key_mutex[key]);
 
+            // Re-check after acquiring locks.
+            bool key_exists = (database.count(key) > 0);
 
             database.erase(key);
             expiry_times.erase(key);
-    {
-    lock_guard<mutex> lru_lock(lru_mutex);
-    remove_from_lru(key);
-}
+            remove_from_lru(key);
+
+            if (key_exists && current_size > 0)
+                current_size--;
 
             save_database();
-           
-append_to_aof(command);
-aof_command_count++;
 
-if (aof_command_count >=
-    AOF_REWRITE_THRESHOLD)
-{
-    rewrite_aof();
+            append_to_aof(command);
+            aof_command_count++;
 
-   
-}
+            if (aof_command_count >=
+                AOF_REWRITE_THRESHOLD)
+            {
+                rewrite_aof();
+            }
 
-          
-             replicate_command(command);
+            replicate_command(command);
             string response = "DELETED";
 
             send(client_socket,
