@@ -43,6 +43,7 @@ string aof_file =
     const int AOF_REWRITE_THRESHOLD = 27;
 
 int aof_command_count = 0;
+int database_save_command_count = 0;
     
     void remove_from_lru(const string& key);
 
@@ -275,7 +276,7 @@ void save_database_locked()
         return;
     }
 
-    aof_command_count = 0;
+    database_save_command_count = 0;
 
     cout << "Database saved!" << endl;
 }
@@ -286,9 +287,10 @@ void save_database()
     lock_guard<mutex> save_lock(database_save_mutex);
 
     // A previous save may have already completed while this thread
-    // was waiting for the save mutex. A successful save resets the AOF
-    // command count, so there is nothing left to save for this trigger.
-    if (aof_command_count == 0)
+    // was waiting for the save mutex. A successful save resets the
+    // database-save command count, so there is nothing left to save
+    // for this trigger.
+    if (database_save_command_count == 0)
         return;
 
     // GET operations can continue because this is a shared lock.
@@ -589,6 +591,7 @@ void handle_client(int client_socket) {
             }
 
             string response = "OK";
+            bool should_save = false;
             bool should_rewrite = false;
 
             {
@@ -650,14 +653,20 @@ void handle_client(int client_socket) {
 
                 // Keep the database lock until this mutation is persisted
                 // in the AOF, so rewrite cannot pass between the two.
-                save_database_locked();
                 append_to_aof(command);
 
                 aof_command_count++;
+                database_save_command_count++;
+
+                if (database_save_command_count >= 10)
+                    should_save = true;
 
                 if (aof_command_count >= AOF_REWRITE_THRESHOLD)
                     should_rewrite = true;
             }
+
+            if (should_save)
+                save_database();
 
             if (should_rewrite)
                 rewrite_aof();
@@ -745,6 +754,7 @@ void handle_client(int client_socket) {
             string key;
             ss >> key;
 
+            bool should_save = false;
             bool should_rewrite = false;
 
             {
@@ -764,14 +774,20 @@ void handle_client(int client_socket) {
                     current_size--;
 
                 // Keep the database lock until DELETE is in the AOF.
-                save_database_locked();
                 append_to_aof(command);
 
                 aof_command_count++;
+                database_save_command_count++;
+
+                if (database_save_command_count >= 10)
+                    should_save = true;
 
                 if (aof_command_count >= AOF_REWRITE_THRESHOLD)
                     should_rewrite = true;
             }
+
+            if (should_save)
+                save_database();
 
             if (should_rewrite)
                 rewrite_aof();
@@ -833,6 +849,8 @@ int main() {
     current_size = database.size();
     aof_command_count =
     count_aof_commands();
+    database_save_command_count =
+    aof_command_count % 10;
 
    
 bool changed = false;
