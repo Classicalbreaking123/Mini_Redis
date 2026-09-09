@@ -29,7 +29,8 @@ unordered_map<string, list<string>::iterator> lru_position;
 
 
 unordered_map<string, shared_mutex> key_mutex;
-
+shared_mutex database_mutex;
+mutex aof_rewrite_mutex;
 
 
 mutex lru_mutex;
@@ -38,7 +39,7 @@ mutex eviction_mutex;
 string database_file = "database/dump.txt";
 string aof_file =
     "database/appendonly.aof";
-    const int AOF_REWRITE_THRESHOLD = 5;
+    const int AOF_REWRITE_THRESHOLD = 27;
 
 int aof_command_count = 0;
     
@@ -71,11 +72,7 @@ bool remove_if_expired_locked(const string& key)
 
    database.erase(key);
 expiry_times.erase(it);
-
-{
-    lock_guard<mutex> lru_lock(lru_mutex);
-    remove_from_lru(key);
-}
+remove_from_lru(key);
     cout << "Expired key removed: "
          << key << endl;
 
@@ -314,10 +311,30 @@ int count_aof_commands()
 
 void rewrite_aof()
 {
-    ofstream outfile(
-        "database/temp.aof"
-    );
+    // Only one AOF rewrite can run at a time.
+    lock_guard<mutex> rewrite_lock(aof_rewrite_mutex);
 
+    // Re-check after acquiring the rewrite lock.
+    // Another thread may have already completed the rewrite.
+    if (aof_command_count < AOF_REWRITE_THRESHOLD)
+        return;
+
+    // Shared database lock allows GET operations while blocking SET/DEL and
+    // other operations that modify the database.
+    shared_lock<shared_mutex> database_lock(database_mutex);
+
+    const string temp_aof_file = "database/temp.aof";
+
+    ofstream outfile(temp_aof_file);
+
+    if (!outfile.is_open())
+    {
+        cerr << "Failed to create temporary AOF file!" << endl;
+        return;
+    }
+
+    // Write the new AOF from the current live database.
+    // SET/DEL cannot change the database while this lock is held.
     for (const auto& entry : database)
     {
         outfile
@@ -330,20 +347,28 @@ void rewrite_aof()
 
     outfile.close();
 
-    remove(
-        "database/appendonly.aof"
-    );
+    if (!outfile)
+    {
+        cerr << "Failed while writing temporary AOF file!" << endl;
+        remove(temp_aof_file.c_str());
+        return;
+    }
 
-    rename(
-        "database/temp.aof",
-        "database/appendonly.aof"
-    );
-    aof_command_count=count_aof_commands();
+    // rename() replaces the destination atomically on POSIX systems.
+    if (rename(temp_aof_file.c_str(), aof_file.c_str()) != 0)
+    {
+        cerr << "Failed to replace AOF file!" << endl;
+        remove(temp_aof_file.c_str());
+        return;
+    }
+
+    aof_command_count = count_aof_commands();
 
     cout
         << "AOF rewritten!"
         << endl;
 }
+
 
 bool cleanup_expired_keys_locked() {
     bool changed = false;
@@ -378,7 +403,8 @@ void expiry_worker()
         {
             bool changed = false;
 
-            // Global lock order: lru_mutex -> key_mutex.
+            // Global lock order: database -> LRU -> key.
+            unique_lock<shared_mutex> database_lock(database_mutex);
             lock_guard<mutex> lru_lock(lru_mutex);
 
             for (auto it = database.begin(); it != database.end(); )
@@ -411,6 +437,7 @@ void expiry_worker()
 
 bool evict_lru_key()
 {
+    unique_lock<shared_mutex> database_lock(database_mutex);
     lock_guard<mutex> lru_lock(lru_mutex);
 
     if (lru_list.empty())
@@ -482,9 +509,11 @@ void handle_client(int client_socket) {
             }
 
             string response = "OK";
+            bool should_rewrite = false;
 
             {
-                // Global lock order: LRU -> key.
+                // Global lock order: database -> LRU -> capacity -> eviction -> key.
+                unique_lock<shared_mutex> database_lock(database_mutex);
                 lock_guard<mutex> lru_lock(lru_mutex);
                 unique_lock<shared_mutex> key_lock(key_mutex[key]);
 
@@ -538,18 +567,20 @@ void handle_client(int client_socket) {
                 }
 
                 touch_lru(key);
+
+                // Keep the database lock until this mutation is persisted
+                // in the AOF, so rewrite cannot pass between the two.
+                save_database();
+                append_to_aof(command);
+
+                aof_command_count++;
+
+                if (aof_command_count >= AOF_REWRITE_THRESHOLD)
+                    should_rewrite = true;
             }
 
-            save_database();
-
-            append_to_aof(command);
-            aof_command_count++;
-
-            if (aof_command_count >=
-                AOF_REWRITE_THRESHOLD)
-            {
+            if (should_rewrite)
                 rewrite_aof();
-            }
 
             replicate_command(command);
             send(client_socket,
@@ -563,39 +594,66 @@ void handle_client(int client_socket) {
             ss >> key;
 
             string response = "KEY NOT FOUND";
-            bool changed = false;
+            bool expired = false;
 
-            // Global lock order: LRU -> key.
-            lock_guard<mutex> lru_lock(lru_mutex);
-            unique_lock<shared_mutex> key_lock(key_mutex[key]);
-
-            auto expiry_it = expiry_times.find(key);
-
-            if (expiry_it != expiry_times.end() &&
-                time(NULL) >= expiry_it->second)
+            // Shared database lock allows normal GETs during AOF rewrite.
             {
-                database.erase(key);
-                expiry_times.erase(expiry_it);
-                remove_from_lru(key);
+                shared_lock<shared_mutex> database_lock(database_mutex);
+                lock_guard<mutex> lru_lock(lru_mutex);
+                shared_lock<shared_mutex> key_lock(key_mutex[key]);
 
-                if (current_size > 0)
-                    current_size--;
+                auto expiry_it = expiry_times.find(key);
 
-                changed = true;
-            }
-            else
-            {
-                auto it = database.find(key);
-
-                if (it != database.end())
+                if (expiry_it != expiry_times.end() &&
+                    time(NULL) >= expiry_it->second)
                 {
-                    response = it->second;
-                    touch_lru(key);
+                    expired = true;
+                }
+                else
+                {
+                    auto it = database.find(key);
+
+                    if (it != database.end())
+                    {
+                        response = it->second;
+                        touch_lru(key);
+                    }
                 }
             }
 
-            if (changed)
-                save_database();
+            // Expired-key cleanup modifies the database, so it needs an
+            // exclusive database lock. Re-check after acquiring it.
+            if (expired)
+            {
+                unique_lock<shared_mutex> database_lock(database_mutex);
+                lock_guard<mutex> lru_lock(lru_mutex);
+                unique_lock<shared_mutex> key_lock(key_mutex[key]);
+
+                auto expiry_it = expiry_times.find(key);
+
+                if (expiry_it != expiry_times.end() &&
+                    time(NULL) >= expiry_it->second)
+                {
+                    database.erase(key);
+                    expiry_times.erase(expiry_it);
+                    remove_from_lru(key);
+
+                    if (current_size > 0)
+                        current_size--;
+
+                    save_database();
+                }
+                else
+                {
+                    auto it = database.find(key);
+
+                    if (it != database.end())
+                    {
+                        response = it->second;
+                        touch_lru(key);
+                    }
+                }
+            }
 
             send(client_socket,
                  response.c_str(),
@@ -607,30 +665,36 @@ void handle_client(int client_socket) {
             string key;
             ss >> key;
 
-            // Global lock order: LRU -> key.
-            lock_guard<mutex> lru_lock(lru_mutex);
-            unique_lock<shared_mutex> key_lock(key_mutex[key]);
+            bool should_rewrite = false;
 
-            // Re-check after acquiring locks.
-            bool key_exists = (database.count(key) > 0);
-
-            database.erase(key);
-            expiry_times.erase(key);
-            remove_from_lru(key);
-
-            if (key_exists && current_size > 0)
-                current_size--;
-
-            save_database();
-
-            append_to_aof(command);
-            aof_command_count++;
-
-            if (aof_command_count >=
-                AOF_REWRITE_THRESHOLD)
             {
-                rewrite_aof();
+                // Global lock order: database -> LRU -> key.
+                unique_lock<shared_mutex> database_lock(database_mutex);
+                lock_guard<mutex> lru_lock(lru_mutex);
+                unique_lock<shared_mutex> key_lock(key_mutex[key]);
+
+                // Re-check after acquiring locks.
+                bool key_exists = (database.count(key) > 0);
+
+                database.erase(key);
+                expiry_times.erase(key);
+                remove_from_lru(key);
+
+                if (key_exists && current_size > 0)
+                    current_size--;
+
+                // Keep the database lock until DELETE is in the AOF.
+                save_database();
+                append_to_aof(command);
+
+                aof_command_count++;
+
+                if (aof_command_count >= AOF_REWRITE_THRESHOLD)
+                    should_rewrite = true;
             }
+
+            if (should_rewrite)
+                rewrite_aof();
 
             replicate_command(command);
             string response = "DELETED";
@@ -640,11 +704,10 @@ void handle_client(int client_socket) {
                  response.length() + 1,
                  0);
         }
-        
+
         else if (operation == "SYNC")
 {
-
-
+    shared_lock<shared_mutex> database_lock(database_mutex);
 
     string response;
 
