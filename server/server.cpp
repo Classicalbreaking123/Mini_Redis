@@ -31,6 +31,7 @@ unordered_map<string, list<string>::iterator> lru_position;
 unordered_map<string, shared_mutex> key_mutex;
 shared_mutex database_mutex;
 mutex aof_rewrite_mutex;
+mutex database_save_mutex;
 
 
 mutex lru_mutex;
@@ -200,23 +201,102 @@ void rebuild_lru_from_database() {
 }
 
 
-void save_database() {
-    ofstream outfile(database_file);
+void save_database_locked()
+{
+    const string temp_database_file = "database/temp_dump.txt";
 
-    for (const auto& entry : database) {
+    ofstream outfile(temp_database_file);
+
+    if (!outfile.is_open())
+    {
+        cerr << "Failed to create temporary database file!" << endl;
+        return;
+    }
+
+    for (const auto& entry : database)
+    {
         long long expiry = -1;
 
         auto it = expiry_times.find(entry.first);
-        if (it != expiry_times.end()) {
+
+        if (it != expiry_times.end())
+        {
             expiry = static_cast<long long>(it->second);
         }
 
-        outfile << entry.first << " "
-                << entry.second << " "
-                << expiry << endl;
+        outfile
+            << entry.first << " "
+            << entry.second << " "
+            << expiry
+            << endl;
     }
 
     outfile.close();
+
+    if (!outfile)
+    {
+        cerr << "Failed while writing temporary database file!" << endl;
+        remove(temp_database_file.c_str());
+        return;
+    }
+
+    // Replace dump.txt only after the new snapshot is complete.
+    if (rename(temp_database_file.c_str(), database_file.c_str()) != 0)
+    {
+        cerr << "Failed to replace database dump file!" << endl;
+        remove(temp_database_file.c_str());
+        return;
+    }
+
+    // Create a fresh empty AOF and atomically replace the old one.
+    const string temp_aof_file = "database/temp_appendonly.aof";
+
+    ofstream new_aof(temp_aof_file);
+
+    if (!new_aof.is_open())
+    {
+        cerr << "Failed to create temporary AOF file!" << endl;
+        return;
+    }
+
+    new_aof.close();
+
+    if (!new_aof)
+    {
+        cerr << "Failed while creating temporary AOF file!" << endl;
+        remove(temp_aof_file.c_str());
+        return;
+    }
+
+    if (rename(temp_aof_file.c_str(), aof_file.c_str()) != 0)
+    {
+        cerr << "Failed to replace AOF file!" << endl;
+        remove(temp_aof_file.c_str());
+        return;
+    }
+
+    aof_command_count = 0;
+
+    cout << "Database saved!" << endl;
+}
+
+void save_database()
+{
+    // Only one database save can run at a time.
+    lock_guard<mutex> save_lock(database_save_mutex);
+
+    // A previous save may have already completed while this thread
+    // was waiting for the save mutex. A successful save resets the AOF
+    // command count, so there is nothing left to save for this trigger.
+    if (aof_command_count == 0)
+        return;
+
+    // GET operations can continue because this is a shared lock.
+    // SET, DEL, expiry cleanup and eviction require the unique lock
+    // and therefore wait until the complete save finishes.
+    shared_lock<shared_mutex> database_lock(database_mutex);
+
+    save_database_locked();
 }
 
 void load_database() {
@@ -425,7 +505,7 @@ void expiry_worker()
 
             if (changed)
             {
-                save_database();
+                save_database_locked();
             }
         }
 
@@ -570,7 +650,7 @@ void handle_client(int client_socket) {
 
                 // Keep the database lock until this mutation is persisted
                 // in the AOF, so rewrite cannot pass between the two.
-                save_database();
+                save_database_locked();
                 append_to_aof(command);
 
                 aof_command_count++;
@@ -641,7 +721,7 @@ void handle_client(int client_socket) {
                     if (current_size > 0)
                         current_size--;
 
-                    save_database();
+                    save_database_locked();
                 }
                 else
                 {
@@ -684,7 +764,7 @@ void handle_client(int client_socket) {
                     current_size--;
 
                 // Keep the database lock until DELETE is in the AOF.
-                save_database();
+                save_database_locked();
                 append_to_aof(command);
 
                 aof_command_count++;
